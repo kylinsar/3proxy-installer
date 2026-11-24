@@ -1,23 +1,32 @@
 #!/usr/bin/env bash
 #
-# 3proxy 一键安装脚本（源码编译 + systemd 服务）
+# 3proxy 一键安装 / 管理脚本（源码编译 + systemd 服务）
 #
 # 支持系统：Debian / Ubuntu / CentOS / RHEL / Rocky / AlmaLinux / Fedora（需 systemd）
 #
 # 用法：
-#   sudo bash install-3proxy.sh              # 安装（默认）
-#   sudo bash install-3proxy.sh uninstall    # 卸载
+#   bash install-3proxy.sh              # 交互式菜单
+#   bash install-3proxy.sh <命令>       # 直接执行某个命令
 #
-# 可通过环境变量自定义（均为可选）：
+# 命令：
+#   install     安装 / 重装
+#   check       检查运行状态（有异常时退出码为 1）
+#   info        查看账号与连接信息
+#   start | stop | restart
+#   log         查看日志
+#   uninstall   卸载
+#
+# 通过 curl 管道运行时，用 "bash -s <命令>" 传命令，例如：
+#   curl -fsSL <脚本链接> | bash              # 菜单
+#   curl -fsSL <脚本链接> | bash -s check     # 直接检查
+#
+# 安装参数可通过环境变量指定（均为可选）：
 #   VERSION=0.9.4          3proxy 版本，默认自动获取 GitHub 最新 release
 #   PROXY_USER=myuser      代理用户名，默认 proxyuser
 #   PROXY_PASS=secret      代理密码，默认随机生成 16 位
 #   SOCKS_PORT=1080        SOCKS5 端口，设为 0 则不启用
 #   HTTP_PORT=3128         HTTP/HTTPS 代理端口，设为 0 则不启用
 #   FORCE_CONFIG=1         覆盖已存在的 /etc/3proxy/3proxy.cfg
-#
-# 示例：
-#   sudo PROXY_USER=alice PROXY_PASS='S3cret!' SOCKS_PORT=1080 HTTP_PORT=0 bash install-3proxy.sh
 
 set -euo pipefail
 
@@ -33,6 +42,7 @@ FORCE_CONFIG="${FORCE_CONFIG:-0}"
 BIN_PATH="/usr/local/bin/3proxy"
 CONF_DIR="/etc/3proxy"
 CONF_FILE="${CONF_DIR}/3proxy.cfg"
+VERSION_FILE="${CONF_DIR}/.version"
 LOG_DIR="/var/log/3proxy"
 SERVICE_FILE="/etc/systemd/system/3proxy.service"
 RUN_USER="3proxy"
@@ -42,9 +52,62 @@ info()  { echo -e "\033[32m[INFO]\033[0m $*"; }
 warn()  { echo -e "\033[33m[WARN]\033[0m $*" >&2; }
 error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; exit 1; }
 
-# ---------- 前置检查 ----------
-check_env() {
+# 是否有可交互的终端（curl | bash 时 stdin 是管道，需从 /dev/tty 读取）
+HAS_TTY=0
+if { : </dev/tty; } 2>/dev/null; then HAS_TTY=1; fi
+
+# ask "提示" 变量名 —— 从终端读取一行输入，无终端时返回空
+ask() {
+  local __a=""
+  if [[ $HAS_TTY == 1 ]]; then
+    read -r -p "$1" __a </dev/tty || true
+  fi
+  printf -v "$2" '%s' "$__a"
+}
+
+require_root() {
   [[ $EUID -eq 0 ]] || error "请使用 root 或 sudo 运行此脚本"
+}
+
+# ---------- 读取现有配置 ----------
+# 设置 CFG_USER / CFG_PASS / CFG_HTTP / CFG_SOCKS，配置不存在时返回 1
+read_config() {
+  CFG_USER=""; CFG_PASS=""; CFG_HTTP=""; CFG_SOCKS=""
+  [[ -f "$CONF_FILE" ]] || return 1
+  local line
+  line="$(grep -m1 -E '^[[:space:]]*users[[:space:]]' "$CONF_FILE" | awk '{print $2}' || true)"
+  if [[ -n "$line" ]]; then
+    CFG_USER="${line%%:*}"
+    CFG_PASS="${line##*:}"
+  fi
+  line="$(grep -m1 -E '^[[:space:]]*proxy([[:space:]]|$)' "$CONF_FILE" || true)"
+  if [[ -n "$line" ]]; then
+    CFG_HTTP="$(grep -oE -- '-p[0-9]+' <<<"$line" | head -n1 | cut -c3- || true)"
+    CFG_HTTP="${CFG_HTTP:-3128}"
+  fi
+  line="$(grep -m1 -E '^[[:space:]]*socks([[:space:]]|$)' "$CONF_FILE" || true)"
+  if [[ -n "$line" ]]; then
+    CFG_SOCKS="$(grep -oE -- '-p[0-9]+' <<<"$line" | head -n1 | cut -c3- || true)"
+    CFG_SOCKS="${CFG_SOCKS:-1080}"
+  fi
+  return 0
+}
+
+PUBLIC_IP=""
+get_ip() {
+  if [[ -z "$PUBLIC_IP" ]]; then
+    PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+    [[ -n "$PUBLIC_IP" ]] || PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    [[ -n "$PUBLIC_IP" ]] || PUBLIC_IP="<服务器IP>"
+  fi
+  echo "$PUBLIC_IP"
+}
+
+# =====================================================================
+#                               安装
+# =====================================================================
+check_env() {
+  require_root
   command -v systemctl >/dev/null 2>&1 || error "未检测到 systemd，本脚本仅支持 systemd 系统"
 
   for p in "$SOCKS_PORT" "$HTTP_PORT"; do
@@ -60,7 +123,6 @@ check_env() {
   fi
 }
 
-# ---------- 安装编译依赖 ----------
 install_deps() {
   info "安装编译依赖..."
   if command -v apt-get >/dev/null 2>&1; then
@@ -76,7 +138,6 @@ install_deps() {
   fi
 }
 
-# ---------- 确定版本 ----------
 resolve_version() {
   if [[ -z "$VERSION" ]]; then
     info "获取 3proxy 最新版本..."
@@ -90,7 +151,6 @@ resolve_version() {
   info "将安装 3proxy ${VERSION}"
 }
 
-# ---------- 下载并编译 ----------
 build_3proxy() {
   local workdir
   workdir="$(mktemp -d)"
@@ -122,7 +182,6 @@ build_3proxy() {
   info "已安装可执行文件：${BIN_PATH}"
 }
 
-# ---------- 创建运行用户与目录 ----------
 setup_user_dirs() {
   if ! id "$RUN_USER" >/dev/null 2>&1; then
     local nologin
@@ -133,22 +192,22 @@ setup_user_dirs() {
   mkdir -p "$CONF_DIR" "$LOG_DIR"
   chown "$RUN_USER":"$RUN_USER" "$LOG_DIR"
   chmod 750 "$LOG_DIR"
+  echo "$VERSION" >"$VERSION_FILE"
 }
 
-# ---------- 生成配置文件 ----------
 write_config() {
   if [[ -f "$CONF_FILE" && "$FORCE_CONFIG" != "1" ]]; then
     warn "配置文件已存在，保留原配置：${CONF_FILE}（如需覆盖请设置 FORCE_CONFIG=1）"
-    CONFIG_KEPT=1
     return
   fi
-  CONFIG_KEPT=0
 
   if [[ -z "$PROXY_PASS" ]]; then
     PROXY_PASS="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16 || true)"
   fi
 
-  [[ -f "$CONF_FILE" ]] && cp -a "$CONF_FILE" "${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  if [[ -f "$CONF_FILE" ]]; then
+    cp -a "$CONF_FILE" "${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
 
   {
     echo "# 由 install-3proxy.sh 生成于 $(date '+%F %T')"
@@ -165,9 +224,8 @@ write_config() {
     echo "auth strong"
     echo "allow ${PROXY_USER}"
     echo ""
-    (( HTTP_PORT  > 0 )) && echo "proxy -p${HTTP_PORT}"
-    (( SOCKS_PORT > 0 )) && echo "socks -p${SOCKS_PORT}"
-    true
+    if (( HTTP_PORT  > 0 )); then echo "proxy -p${HTTP_PORT}"; fi
+    if (( SOCKS_PORT > 0 )); then echo "socks -p${SOCKS_PORT}"; fi
   } >"$CONF_FILE"
 
   # 配置中含明文密码，仅允许 root 与运行用户读取
@@ -176,7 +234,6 @@ write_config() {
   info "已生成配置文件：${CONF_FILE}"
 }
 
-# ---------- systemd 服务 ----------
 write_service() {
   cat >"$SERVICE_FILE" <<EOF
 [Unit]
@@ -210,14 +267,15 @@ EOF
   info "3proxy 服务已启动并设为开机自启"
 }
 
-# ---------- 防火墙放行 ----------
 open_firewall() {
-  [[ "${CONFIG_KEPT:-0}" == "1" ]] && return  # 保留旧配置时不确定端口，跳过
-  local ports=()
-  (( SOCKS_PORT > 0 )) && ports+=("$SOCKS_PORT")
-  (( HTTP_PORT  > 0 )) && ports+=("$HTTP_PORT")
+  read_config || return 0
+  local ports=() p fw
+  if [[ -n "$CFG_SOCKS" ]]; then ports+=("$CFG_SOCKS"); fi
+  if [[ -n "$CFG_HTTP"  ]]; then ports+=("$CFG_HTTP");  fi
+  (( ${#ports[@]} > 0 )) || return 0
 
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  fw="$(ufw status 2>/dev/null || true)"
+  if [[ "$fw" == *"Status: active"* ]]; then
     for p in "${ports[@]}"; do ufw allow "${p}/tcp" >/dev/null; done
     info "已在 ufw 放行端口：${ports[*]}"
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -229,40 +287,219 @@ open_firewall() {
   fi
 }
 
-# ---------- 安装结果 ----------
-print_summary() {
-  local ip
-  ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo '<服务器IP>')"
-
+do_install() {
+  check_env
+  install_deps
+  resolve_version
+  build_3proxy
+  setup_user_dirs
+  write_config
+  write_service
+  open_firewall
   echo
-  echo "================ 3proxy 安装完成 ================"
-  echo " 版本      : ${VERSION}"
+  info "安装完成！"
+  show_info
+}
+
+# 菜单中的安装：交互式询问参数
+menu_install() {
+  local v=""
+  if [[ -f "$CONF_FILE" ]]; then
+    ask "检测到已有配置，是否重新生成（会覆盖账号和端口）？[y/N] " v
+    if [[ "$v" =~ ^[Yy]$ ]]; then FORCE_CONFIG=1; fi
+  fi
+  if [[ ! -f "$CONF_FILE" || "$FORCE_CONFIG" == "1" ]]; then
+    ask "代理用户名 [${PROXY_USER}]: " v;              if [[ -n "$v" ]]; then PROXY_USER="$v"; fi
+    ask "代理密码（留空随机生成）: " v;                if [[ -n "$v" ]]; then PROXY_PASS="$v"; fi
+    ask "SOCKS5 端口，0 为不启用 [${SOCKS_PORT}]: " v; if [[ -n "$v" ]]; then SOCKS_PORT="$v"; fi
+    ask "HTTP 端口，0 为不启用 [${HTTP_PORT}]: " v;    if [[ -n "$v" ]]; then HTTP_PORT="$v"; fi
+  fi
+  do_install
+}
+
+# =====================================================================
+#                              信息与检查
+# =====================================================================
+show_info() {
+  if ! read_config; then
+    warn "未找到配置文件 ${CONF_FILE}，请先安装"
+    return 0
+  fi
+  local ip
+  ip="$(get_ip)"
+  echo
+  echo "================ 3proxy 连接信息 ================"
+  echo " 版本      : $(cat "$VERSION_FILE" 2>/dev/null || echo 未知)"
   echo " 配置文件  : ${CONF_FILE}"
   echo " 日志目录  : ${LOG_DIR}"
-  echo " 服务管理  : systemctl {start|stop|restart|status} 3proxy"
-  if [[ "${CONFIG_KEPT:-0}" == "1" ]]; then
-    echo " （沿用已有配置，账号与端口请查看 ${CONF_FILE}）"
-  else
-    echo " 用户名    : ${PROXY_USER}"
-    echo " 密码      : ${PROXY_PASS}"
-    (( SOCKS_PORT > 0 )) && echo " SOCKS5    : socks5://${PROXY_USER}:${PROXY_PASS}@${ip}:${SOCKS_PORT}"
-    (( HTTP_PORT  > 0 )) && echo " HTTP      : http://${PROXY_USER}:${PROXY_PASS}@${ip}:${HTTP_PORT}"
-    echo
-    echo " 测试命令："
-    (( SOCKS_PORT > 0 )) && echo "   curl -x socks5h://${PROXY_USER}:${PROXY_PASS}@${ip}:${SOCKS_PORT} https://ifconfig.me"
-    (( HTTP_PORT  > 0 )) && echo "   curl -x http://${PROXY_USER}:${PROXY_PASS}@${ip}:${HTTP_PORT} https://ifconfig.me"
-  fi
+  echo " 用户名    : ${CFG_USER}"
+  echo " 密码      : ${CFG_PASS}"
+  if [[ -n "$CFG_SOCKS" ]]; then echo " SOCKS5    : socks5://${CFG_USER}:${CFG_PASS}@${ip}:${CFG_SOCKS}"; fi
+  if [[ -n "$CFG_HTTP"  ]]; then echo " HTTP      : http://${CFG_USER}:${CFG_PASS}@${ip}:${CFG_HTTP}"; fi
   echo "================================================="
 }
 
-# ---------- 卸载 ----------
+CHECK_FAIL=0
+chk_ok()   { echo -e "  \033[32m✓\033[0m $*"; }
+chk_bad()  { echo -e "  \033[31m✗\033[0m $*"; CHECK_FAIL=$((CHECK_FAIL + 1)); }
+chk_warn() { echo -e "  \033[33m!\033[0m $*"; }
+
+check_status() {
+  CHECK_FAIL=0
+  echo
+  echo "================ 3proxy 状态检查 ================"
+
+  # 1. 程序
+  if [[ -x "$BIN_PATH" ]]; then
+    chk_ok "程序已安装：${BIN_PATH}（版本 $(cat "$VERSION_FILE" 2>/dev/null || echo 未知)）"
+  else
+    chk_bad "程序未安装：${BIN_PATH} 不存在"
+  fi
+
+  # 2. 配置
+  if read_config; then
+    chk_ok "配置文件存在：${CONF_FILE}"
+    if [[ -z "$CFG_HTTP" && -z "$CFG_SOCKS" ]]; then
+      chk_bad "配置中没有 proxy / socks 监听项"
+    fi
+  else
+    chk_bad "配置文件不存在：${CONF_FILE}"
+  fi
+
+  # 3. 服务
+  if systemctl is-active --quiet 3proxy 2>/dev/null; then
+    local since
+    since="$(systemctl show 3proxy -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+    chk_ok "服务运行中（启动于 ${since:-未知}）"
+  else
+    chk_bad "服务未运行（$(systemctl is-active 3proxy 2>/dev/null || true)）"
+  fi
+  if systemctl is-enabled --quiet 3proxy 2>/dev/null; then
+    chk_ok "已设为开机自启"
+  else
+    chk_warn "未设为开机自启（可执行 systemctl enable 3proxy）"
+  fi
+
+  # 4. 端口监听
+  local listen p name
+  listen="$(ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null || true)"
+  for name in SOCKS5 HTTP; do
+    if [[ $name == SOCKS5 ]]; then p="${CFG_SOCKS:-}"; else p="${CFG_HTTP:-}"; fi
+    [[ -n "$p" ]] || continue
+    if grep -qE ":${p}[[:space:]]" <<<"$listen"; then
+      chk_ok "${name} 端口 ${p} 正在监听"
+    else
+      chk_bad "${name} 端口 ${p} 未监听"
+    fi
+  done
+
+  # 5. 本机代理连通性
+  if [[ -n "${CFG_USER:-}" ]]; then
+    local out
+    for name in SOCKS5 HTTP; do
+      if [[ $name == SOCKS5 ]]; then
+        p="${CFG_SOCKS:-}"; [[ -n "$p" ]] || continue
+        out="$(curl -sS --max-time 10 -x "socks5h://127.0.0.1:${p}" -U "${CFG_USER}:${CFG_PASS}" https://api.ipify.org 2>&1 || echo "__FAIL__ $?")"
+      else
+        p="${CFG_HTTP:-}"; [[ -n "$p" ]] || continue
+        out="$(curl -sS --max-time 10 -x "http://127.0.0.1:${p}" -U "${CFG_USER}:${CFG_PASS}" https://api.ipify.org 2>&1 || echo "__FAIL__ $?")"
+      fi
+      if [[ "$out" == *__FAIL__* ]]; then
+        chk_bad "${name} 代理测试失败：$(head -n1 <<<"$out")"
+      else
+        chk_ok "${name} 代理可用，出口 IP：${out}"
+      fi
+    done
+  fi
+
+  # 6. 防火墙
+  local fw ports=()
+  if [[ -n "${CFG_SOCKS:-}" ]]; then ports+=("$CFG_SOCKS"); fi
+  if [[ -n "${CFG_HTTP:-}"  ]]; then ports+=("$CFG_HTTP");  fi
+  fw="$(ufw status 2>/dev/null || true)"
+  if [[ "$fw" == *"Status: active"* ]]; then
+    for p in ${ports[@]+"${ports[@]}"}; do
+      if grep -qE "^${p}(/tcp)?[[:space:]].*ALLOW" <<<"$fw"; then
+        chk_ok "ufw 已放行端口 ${p}"
+      else
+        chk_bad "ufw 未放行端口 ${p}（可执行 ufw allow ${p}/tcp）"
+      fi
+    done
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    for p in ${ports[@]+"${ports[@]}"}; do
+      if firewall-cmd --query-port="${p}/tcp" >/dev/null 2>&1; then
+        chk_ok "firewalld 已放行端口 ${p}"
+      else
+        chk_bad "firewalld 未放行端口 ${p}"
+      fi
+    done
+  else
+    chk_ok "系统防火墙未启用（云服务器请确认安全组已放行端口 ${ports[*]:-}）"
+  fi
+
+  # 7. 日志
+  local latest
+  latest="$(ls -t "${LOG_DIR}"/3proxy.log* 2>/dev/null | head -n1 || true)"
+  if [[ -n "$latest" ]]; then
+    chk_ok "最新访问日志：${latest}（$(wc -l <"$latest" | tr -d ' ') 条记录）"
+  else
+    chk_warn "暂无访问日志（还没有人使用过代理时属于正常）"
+  fi
+
+  echo "-------------------------------------------------"
+  if (( CHECK_FAIL == 0 )); then
+    echo -e " 结论：\033[32m一切正常\033[0m"
+  else
+    echo -e " 结论：\033[31m发现 ${CHECK_FAIL} 项异常\033[0m"
+    if ! systemctl is-active --quiet 3proxy 2>/dev/null && [[ -x "$BIN_PATH" ]]; then
+      echo " 最近的服务日志："
+      journalctl -u 3proxy -n 10 --no-pager 2>/dev/null | sed 's/^/   /' || true
+    fi
+  fi
+  echo "================================================="
+  return 0
+}
+
+show_log() {
+  echo "------ 服务日志（最近 30 行）------"
+  journalctl -u 3proxy -n 30 --no-pager 2>/dev/null || true
+  local latest
+  latest="$(ls -t "${LOG_DIR}"/3proxy.log* 2>/dev/null | head -n1 || true)"
+  if [[ -n "$latest" ]]; then
+    echo
+    echo "------ 访问日志 ${latest}（最近 20 行）------"
+    tail -n 20 "$latest"
+  fi
+}
+
+service_ctl() {
+  require_root
+  [[ -f "$SERVICE_FILE" ]] || error "3proxy 未安装"
+  systemctl "$1" 3proxy
+  sleep 1
+  if systemctl is-active --quiet 3proxy; then
+    info "3proxy 当前状态：运行中"
+  else
+    info "3proxy 当前状态：已停止"
+  fi
+}
+
+# =====================================================================
+#                               卸载
+# =====================================================================
 uninstall() {
-  [[ $EUID -eq 0 ]] || error "请使用 root 或 sudo 运行此脚本"
+  require_root
+  local ans=""
+  ask "确认卸载 3proxy？[y/N] " ans
+  if [[ $HAS_TTY == 1 && ! "$ans" =~ ^[Yy]$ ]]; then
+    info "已取消"
+    return 0
+  fi
   info "卸载 3proxy..."
   systemctl disable --now 3proxy 2>/dev/null || true
   rm -f "$SERVICE_FILE" "$BIN_PATH"
   systemctl daemon-reload 2>/dev/null || true
-  read -r -p "是否同时删除配置 ${CONF_DIR} 和日志 ${LOG_DIR}？[y/N] " ans || ans=""
+  ask "是否同时删除配置 ${CONF_DIR} 和日志 ${LOG_DIR}？[y/N] " ans
   if [[ "$ans" =~ ^[Yy]$ ]]; then
     rm -rf "$CONF_DIR" "$LOG_DIR"
     userdel "$RUN_USER" 2>/dev/null || true
@@ -271,26 +508,76 @@ uninstall() {
   info "卸载完成"
 }
 
+# =====================================================================
+#                               菜单
+# =====================================================================
+status_text() {
+  if [[ ! -x "$BIN_PATH" ]]; then
+    echo -e "\033[33m未安装\033[0m"
+  elif systemctl is-active --quiet 3proxy 2>/dev/null; then
+    echo -e "\033[32m运行中\033[0m"
+  else
+    echo -e "\033[31m已停止\033[0m"
+  fi
+}
+
+menu() {
+  require_root
+  local choice="" _
+  while true; do
+    echo
+    echo "=========== 3proxy 管理菜单 ==========="
+    echo -e " 当前状态：$(status_text)"
+    echo "---------------------------------------"
+    echo "  1. 安装 / 重装 3proxy"
+    echo "  2. 检查运行状态"
+    echo "  3. 查看账号与连接信息"
+    echo "  4. 启动服务"
+    echo "  5. 停止服务"
+    echo "  6. 重启服务"
+    echo "  7. 查看日志"
+    echo "  8. 卸载 3proxy"
+    echo "  0. 退出"
+    echo "======================================="
+    ask "请输入选项 [0-8]: " choice
+    case "$choice" in
+      1) menu_install ;;
+      2) check_status ;;
+      3) show_info ;;
+      4) service_ctl start ;;
+      5) service_ctl stop ;;
+      6) service_ctl restart ;;
+      7) show_log ;;
+      8) uninstall ;;
+      0|q|Q) exit 0 ;;
+      *) warn "无效选项：${choice}" ;;
+    esac
+    ask "按回车键返回菜单..." _
+  done
+}
+
+usage() {
+  echo "用法: $0 [install|check|info|start|stop|restart|log|uninstall]"
+  echo "不带参数运行时进入交互式菜单"
+}
+
 main() {
-  case "${1:-install}" in
-    install)
-      check_env
-      install_deps
-      resolve_version
-      build_3proxy
-      setup_user_dirs
-      write_config
-      write_service
-      open_firewall
-      print_summary
-      ;;
-    uninstall)
-      uninstall
-      ;;
-    *)
-      echo "用法: $0 [install|uninstall]"
-      exit 1
-      ;;
+  local cmd="${1:-}"
+  if [[ -z "$cmd" ]]; then
+    # 无终端（如自动化环境）时保持旧行为：直接安装
+    if [[ $HAS_TTY == 1 ]]; then cmd="menu"; else cmd="install"; fi
+  fi
+
+  case "$cmd" in
+    menu)            menu ;;
+    install)         do_install ;;
+    check|status)    check_status; exit $(( CHECK_FAIL > 0 ? 1 : 0 )) ;;
+    info)            show_info ;;
+    start|stop|restart) service_ctl "$cmd" ;;
+    log|logs)        show_log ;;
+    uninstall)       uninstall ;;
+    -h|--help|help)  usage ;;
+    *)               usage; exit 1 ;;
   esac
 }
 
