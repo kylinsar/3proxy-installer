@@ -12,6 +12,7 @@
 #   install     安装 / 重装
 #   check       检查运行状态（有异常时退出码为 1）
 #   info        查看账号与连接信息
+#   port [S] [H] 修改端口：S=SOCKS5 端口，H=HTTP 端口（r 随机，0 关闭，不填则交互询问）
 #   start | stop | restart
 #   log         查看日志
 #   uninstall   卸载
@@ -472,6 +473,77 @@ show_log() {
   fi
 }
 
+# ---------- 修改端口 ----------
+random_port() {
+  local p listen
+  listen="$(ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null || true)"
+  while :; do
+    p=$(( ((RANDOM << 15) | RANDOM) % 40000 + 20000 ))
+    if ! grep -qE ":${p}[[:space:]]" <<<"$listen"; then break; fi
+  done
+  echo "$p"
+}
+
+# change_ports [新SOCKS端口] [新HTTP端口]；不传参数时交互式询问
+# 端口值：数字 = 新端口，r = 随机，0 = 关闭，留空 = 保持不变
+change_ports() {
+  require_root
+  read_config || error "未找到配置文件 ${CONF_FILE}，请先安装"
+  local new_socks="${1:-}" new_http="${2:-}" p listen backup
+  if [[ -z "$new_socks" && -z "$new_http" ]]; then
+    echo "当前端口：SOCKS5=${CFG_SOCKS:-未启用}  HTTP=${CFG_HTTP:-未启用}"
+    ask "新的 SOCKS5 端口（回车保持不变，r 随机，0 关闭）: " new_socks
+    ask "新的 HTTP 端口（回车保持不变，r 随机，0 关闭）: " new_http
+  fi
+  [[ -n "$new_socks" ]] || new_socks="${CFG_SOCKS:-0}"
+  [[ -n "$new_http"  ]] || new_http="${CFG_HTTP:-0}"
+  if [[ "$new_socks" == [rR] ]]; then new_socks="$(random_port)"; fi
+  if [[ "$new_http"  == [rR] ]]; then new_http="$(random_port)"; fi
+
+  for p in "$new_socks" "$new_http"; do
+    [[ "$p" =~ ^[0-9]+$ ]] && (( p <= 65535 )) || error "端口无效：$p"
+  done
+  (( new_socks > 0 || new_http > 0 )) || error "SOCKS5 和 HTTP 不能同时关闭"
+  (( new_socks != new_http )) || error "SOCKS5 与 HTTP 端口不能相同"
+
+  listen="$(ss -lnt 2>/dev/null || netstat -lnt 2>/dev/null || true)"
+  for p in "$new_socks" "$new_http"; do
+    (( p > 0 )) || continue
+    [[ "$p" == "${CFG_SOCKS:-}" || "$p" == "${CFG_HTTP:-}" ]] && continue
+    if grep -qE ":${p}[[:space:]]" <<<"$listen"; then
+      error "端口 ${p} 已被其他程序占用，请换一个"
+    fi
+  done
+
+  if [[ "$new_socks" == "${CFG_SOCKS:-0}" && "$new_http" == "${CFG_HTTP:-0}" ]]; then
+    info "端口没有变化"
+    return 0
+  fi
+
+  backup="${CONF_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a "$CONF_FILE" "$backup"
+  local rest
+  rest="$(grep -vE '^[[:space:]]*(proxy|socks)([[:space:]]|$)' "$CONF_FILE" || true)"
+  printf '%s\n' "$rest" >"$CONF_FILE"
+  if (( new_http  > 0 )); then echo "proxy -p${new_http}"  >>"$CONF_FILE"; fi
+  if (( new_socks > 0 )); then echo "socks -p${new_socks}" >>"$CONF_FILE"; fi
+  chown root:"$RUN_USER" "$CONF_FILE"
+  chmod 640 "$CONF_FILE"
+
+  systemctl restart 3proxy
+  sleep 1
+  if ! systemctl is-active --quiet 3proxy; then
+    journalctl -u 3proxy -n 10 --no-pager >&2 || true
+    cp -a "$backup" "$CONF_FILE"
+    systemctl restart 3proxy || true
+    error "使用新端口启动失败，已恢复原配置"
+  fi
+  info "端口已修改：SOCKS5=$( (( new_socks > 0 )) && echo "$new_socks" || echo 关闭)  HTTP=$( (( new_http > 0 )) && echo "$new_http" || echo 关闭)"
+  open_firewall
+  show_info
+  warn "云服务器请记得在安全组放行新端口，并同步修改客户端设置"
+}
+
 service_ctl() {
   require_root
   [[ -f "$SERVICE_FILE" ]] || error "3proxy 未安装"
@@ -532,23 +604,25 @@ menu() {
     echo "  1. 安装 / 重装 3proxy"
     echo "  2. 检查运行状态"
     echo "  3. 查看账号与连接信息"
-    echo "  4. 启动服务"
-    echo "  5. 停止服务"
-    echo "  6. 重启服务"
-    echo "  7. 查看日志"
-    echo "  8. 卸载 3proxy"
+    echo "  4. 修改端口"
+    echo "  5. 启动服务"
+    echo "  6. 停止服务"
+    echo "  7. 重启服务"
+    echo "  8. 查看日志"
+    echo "  9. 卸载 3proxy"
     echo "  0. 退出"
     echo "======================================="
-    ask "请输入选项 [0-8]: " choice
+    ask "请输入选项 [0-9]: " choice
     case "$choice" in
       1) menu_install ;;
       2) check_status ;;
       3) show_info ;;
-      4) service_ctl start ;;
-      5) service_ctl stop ;;
-      6) service_ctl restart ;;
-      7) show_log ;;
-      8) uninstall ;;
+      4) change_ports ;;
+      5) service_ctl start ;;
+      6) service_ctl stop ;;
+      7) service_ctl restart ;;
+      8) show_log ;;
+      9) uninstall ;;
       0|q|Q) exit 0 ;;
       *) warn "无效选项：${choice}" ;;
     esac
@@ -557,7 +631,8 @@ menu() {
 }
 
 usage() {
-  echo "用法: $0 [install|check|info|start|stop|restart|log|uninstall]"
+  echo "用法: $0 [install|check|info|port|start|stop|restart|log|uninstall]"
+  echo "      $0 port <SOCKS5端口> <HTTP端口>   # 端口填 r 随机、0 关闭"
   echo "不带参数运行时进入交互式菜单"
 }
 
@@ -573,6 +648,7 @@ main() {
     install)         do_install ;;
     check|status)    check_status; exit $(( CHECK_FAIL > 0 ? 1 : 0 )) ;;
     info)            show_info ;;
+    port|ports)      change_ports "${2:-}" "${3:-}" ;;
     start|stop|restart) service_ctl "$cmd" ;;
     log|logs)        show_log ;;
     uninstall)       uninstall ;;
