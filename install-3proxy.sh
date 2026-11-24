@@ -25,8 +25,8 @@
 #   VERSION=0.9.4          3proxy 版本，默认自动获取 GitHub 最新 release
 #   PROXY_USER=myuser      代理用户名，默认 proxyuser
 #   PROXY_PASS=secret      代理密码，默认随机生成 16 位
-#   SOCKS_PORT=1080        SOCKS5 端口，设为 0 则不启用
-#   HTTP_PORT=3128         HTTP/HTTPS 代理端口，设为 0 则不启用
+#   SOCKS_PORT=23456       SOCKS5 端口，默认随机（20000-60000），设为 0 则不启用
+#   HTTP_PORT=34567        HTTP/HTTPS 代理端口，默认随机，设为 0 则不启用
 #   FORCE_CONFIG=1         覆盖已存在的 /etc/3proxy/3proxy.cfg
 
 set -euo pipefail
@@ -36,8 +36,9 @@ VERSION="${VERSION:-}"
 FALLBACK_VERSION="0.9.4"
 PROXY_USER="${PROXY_USER:-proxyuser}"
 PROXY_PASS="${PROXY_PASS:-}"
-SOCKS_PORT="${SOCKS_PORT:-1080}"
-HTTP_PORT="${HTTP_PORT:-3128}"
+# 默认使用随机端口（r），避开 1080/3128 等常被服务商封禁的代理端口
+SOCKS_PORT="${SOCKS_PORT:-r}"
+HTTP_PORT="${HTTP_PORT:-r}"
 FORCE_CONFIG="${FORCE_CONFIG:-0}"
 
 BIN_PATH="/usr/local/bin/3proxy"
@@ -110,6 +111,13 @@ get_ip() {
 check_env() {
   require_root
   command -v systemctl >/dev/null 2>&1 || error "未检测到 systemd，本脚本仅支持 systemd 系统"
+
+  # r = 随机端口
+  if [[ "$SOCKS_PORT" == [rR] ]]; then SOCKS_PORT="$(random_port)"; fi
+  if [[ "$HTTP_PORT" == [rR] ]]; then
+    HTTP_PORT="$(random_port)"
+    while [[ "$HTTP_PORT" == "$SOCKS_PORT" ]]; do HTTP_PORT="$(random_port)"; done
+  fi
 
   for p in "$SOCKS_PORT" "$HTTP_PORT"; do
     [[ "$p" =~ ^[0-9]+$ ]] && (( p >= 0 && p <= 65535 )) || error "端口无效：$p"
@@ -312,8 +320,8 @@ menu_install() {
   if [[ ! -f "$CONF_FILE" || "$FORCE_CONFIG" == "1" ]]; then
     ask "代理用户名 [${PROXY_USER}]: " v;              if [[ -n "$v" ]]; then PROXY_USER="$v"; fi
     ask "代理密码（留空随机生成）: " v;                if [[ -n "$v" ]]; then PROXY_PASS="$v"; fi
-    ask "SOCKS5 端口，0 为不启用 [${SOCKS_PORT}]: " v; if [[ -n "$v" ]]; then SOCKS_PORT="$v"; fi
-    ask "HTTP 端口，0 为不启用 [${HTTP_PORT}]: " v;    if [[ -n "$v" ]]; then HTTP_PORT="$v"; fi
+    ask "SOCKS5 端口（回车随机，0 不启用）: " v; SOCKS_PORT="${v:-r}"
+    ask "HTTP 端口（回车随机，0 不启用）: " v;   HTTP_PORT="${v:-r}"
   fi
   do_install
 }
